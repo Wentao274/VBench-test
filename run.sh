@@ -33,6 +33,9 @@ ARGS=(--gateway_url "$GATEWAY_URL" --model "$MODEL" --output_dir "$OUTPUT_DIR")
 if [ -n "${GPU_ID:-}" ]; then
     ARGS+=(--gpu_id "$GPU_ID")
 fi
+if [ -n "${CONCURRENCY:-}" ]; then
+    ARGS+=(--concurrency "$CONCURRENCY")
+fi
 if [ "${LOAD_LOCAL:-}" = "true" ]; then
     ARGS+=(--load_ckpt_from_local)
 fi
