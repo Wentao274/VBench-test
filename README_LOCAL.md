@@ -208,7 +208,7 @@ python run_vbench_main.py \
 # 按 Ctrl+B 再按 D 脱离会话；重新登录后 tmux attach -t vbench 回来看进度
 ```
 
-中断（断网/断电/手动 Ctrl+C）后**重跑同一命令**即可续跑：已落盘的视频自动跳过，已成功的评测维度自动复用，从断点继续。
+中断（断网/断电/手动 Ctrl+C）后**加 `--resume` 重跑**即可续跑，详见下文「中断续跑」。
 
 > 已按下文「配置文件运行」创建 `vbench.env` 的话，本步命令可简化为 `./run.sh`。
 
@@ -222,6 +222,38 @@ python run_vbench_main.py \
 python compare_runs.py \
     run1/evaluation_results/final_scores.json \
     run2/evaluation_results/final_scores.json
+```
+
+### 中断续跑（--resume）
+
+采样或评测中途断掉后，一条命令续跑：
+
+```bash
+./run.sh --resume
+```
+
+`--resume` 会复用 `--output_dir` 下**最新**的时间戳目录，然后：
+
+| 阶段 | 行为 |
+|---|---|
+| 采样续跑 | 已落盘的视频自动跳过，只补缺失的（Idempotency-Key 保证服务端不会重复生成） |
+| 评测续跑 | 已成功的维度直接复用（分数表标 `(reused)`），只重评失败/未完成的维度 |
+
+细节与注意事项：
+
+- **每个维度评完立即落盘** `final_scores.json` —— Ctrl+C 最多损失正在评测的那一个维度
+- **切勿**在续跑前先运行不带 `--resume` 的命令：那会新建一个空时间戳目录并成为“最新”，旧目录的视频就不会被续用
+- `--resume` 可叠加临时参数：`./run.sh --resume --skip_eval`（只补视频不评测）、`./run.sh --resume --force`（忽略旧结果全部重评）、`./run.sh --resume --gpu_id 1`（换卡续跑）
+- 评测跑完但个别维度失败时，也用 `--resume` 补齐——成功维度自动复用，只补失败维度
+
+不用 run.sh 的等价手动流程：
+
+```bash
+# 1. 直接指向旧时间戳目录，只补缺失视频
+python sample_videos.py --gateway_url <GATEWAY_URL> --model minimax-h3 --all \
+    --output_dir ./sampled_videos/h3/<旧时间戳目录>
+# 2. 评测该目录（成功维度复用）
+./run.sh --skip_sample
 ```
 
 ### 长任务与多卡提示

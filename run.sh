@@ -8,6 +8,7 @@
 #   ./run.sh                                          按 vbench.env 全量运行
 #   ./run.sh --preflight                              环境体检
 #   ./run.sh --skip_sample                            只评测最新一批已生成的视频
+#   ./run.sh --resume                                 中断后续跑（补缺失视频 + 复用成功维度）
 #   ./run.sh --dimensions subject_consistency --max_prompts 1   冒烟测试
 #
 # 规则: 配置文件管每次都一样的参数，命令行管本次临时参数；

@@ -186,6 +186,10 @@ def parse_args():
                         help="Skip step 1, evaluate the latest timestamped run")
     parser.add_argument("--skip_eval", action="store_true",
                         help="Skip step 2 (only generate videos)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume the LATEST timestamped run under --output_dir: "
+                             "finish missing videos (existing files are skipped), "
+                             "then re-evaluate with successful-dimension reuse")
     parser.add_argument("--dry_run", action="store_true",
                         help="Show plan without calling APIs or evaluating")
     parser.add_argument("--preflight", action="store_true",
@@ -413,7 +417,22 @@ def main():
         sys.exit(1)
 
     # Determine the actual run directory (with timestamp subdirectory)
-    if not args.skip_sample:
+    if args.resume:
+        # Resume: continue the latest existing run — sampling fills in only
+        # the missing videos (existing files are skipped), evaluation reuses
+        # previously successful dimension results.
+        latest = find_latest_timestamp(args.output_dir)
+        if latest is None:
+            print(f"ERROR: no timestamped run found under {args.output_dir}")
+            print(f"  Run without --resume first.")
+            sys.exit(1)
+        run_dir = os.path.join(args.output_dir, latest)
+        existing = [
+            f for f in os.listdir(run_dir)
+            if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(run_dir, f))
+        ] if os.path.isdir(run_dir) else []
+        print(f"  Resuming latest run: {latest} ({len(existing)} video(s) already on disk)")
+    elif not args.skip_sample:
         # Fresh sampling: create a new timestamp directory.
         # If the exact-second directory already exists (collision), append a
         # numeric suffix instead of mixing videos into the existing run.

@@ -542,6 +542,61 @@ def main():
     dimension_scores = {}
     eval_details = {}
 
+    # Merge first: dims from a previous run that are NOT part of this run's
+    # request are kept in the working set from the start, so incremental
+    # saves never lose them. Dims attempted this run keep their current
+    # outcome (a failed --force re-run must not be masked by the old value).
+    if prev_results is not None:
+        merged_from_previous = []
+        for dim, detail in prev_results.get("details", {}).items():
+            if dim in dimensions or dim not in DIMENSION_TO_PROMPT_FILE:
+                continue
+            if isinstance(detail, dict) and detail.get("status") == "success" \
+                    and detail.get("score") is not None:
+                dimension_scores[dim] = float(detail["score"])
+                eval_details[dim] = dict(detail, reused=True)
+                merged_from_previous.append(dim)
+        if merged_from_previous:
+            print(f"\n  Merged {len(merged_from_previous)} dimension(s) from previous results: "
+                  f"{', '.join(merged_from_previous)}")
+
+    def save_results_snapshot():
+        """Persist current results to final_scores.json.
+
+        Called after every completed dimension (and once at the end), so an
+        interruption loses at most the dimension currently being evaluated.
+        """
+        quality, semantic, total, normalized = calculate_scores(
+            dimension_scores, dimensions
+        )
+        is_partial = len(dimension_scores) < len(ALL_DIMENSIONS)
+        results = {
+            "summary": {
+                "quality_score": round(quality, 4),
+                "semantic_score": round(semantic, 4),
+                "total_score": round(total, 4),
+                "is_partial_evaluation": is_partial,
+                "evaluated_dimensions": len(dimension_scores),
+                "total_dimensions": len(ALL_DIMENSIONS),
+            },
+            "dimension_scores": {
+                dim: round(score, 4) for dim, score in dimension_scores.items()
+            },
+            "normalized_scores": {
+                k: round(v, 4) for k, v in normalized.items()
+            },
+            "details": eval_details,
+        }
+        os.makedirs(args.output_path, exist_ok=True)
+        # Safety backup of the previous results before overwriting
+        if os.path.exists(results_path):
+            try:
+                shutil.copy2(results_path, results_path + ".bak")
+            except Exception as e:
+                print(f"  WARNING: could not back up previous results: {e}")
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
     for i, dim in enumerate(dimensions, 1):
         print(f"\n  --- [{i}/{len(dimensions)}] {dim} ---")
 
@@ -554,6 +609,7 @@ def main():
                 print(f"    [SKIP] Reusing previous result (score={score:.4f}); use --force to re-evaluate")
                 dimension_scores[dim] = score
                 eval_details[dim] = dict(prev_detail, reused=True)
+                save_results_snapshot()
                 continue
 
         eval_videos = clean_dir
@@ -566,6 +622,7 @@ def main():
             if filtered_dir is None:
                 print(f"    [FAILED] Static filter failed for {dim}")
                 eval_details[dim] = {"status": "filter_failed", "score": 0.0}
+                save_results_snapshot()
                 continue
             eval_videos = filtered_dir
         elif dim == "temporal_flickering" and args.skip_static_filter:
@@ -582,6 +639,7 @@ def main():
         if eval_json is None:
             print(f"    [FAILED] Evaluation failed for {dim} ({elapsed:.1f}s)")
             eval_details[dim] = {"status": "eval_failed", "score": 0.0}
+            save_results_snapshot()
             continue
 
         # Extract score
@@ -589,6 +647,7 @@ def main():
         if score is None:
             print(f"    [FAILED] Could not extract score for {dim}")
             eval_details[dim] = {"status": "score_extraction_failed", "score": 0.0}
+            save_results_snapshot()
             continue
 
         print(f"    [OK] Score: {score:.4f}  ({elapsed:.1f}s)")
@@ -599,61 +658,16 @@ def main():
             "eval_json": eval_json,
             "elapsed_s": round(elapsed, 1),
         }
+        save_results_snapshot()
 
-    # Merge: keep results of dimensions that were evaluated in previous runs
-    # but are NOT part of this run's request (dims attempted this run keep
-    # their current outcome — a failed --force re-run must not be masked by
-    # the old value).
-    if prev_results is not None:
-        merged_from_previous = []
-        for dim, detail in prev_results.get("details", {}).items():
-            if dim in eval_details or dim not in DIMENSION_TO_PROMPT_FILE:
-                continue
-            if isinstance(detail, dict) and detail.get("status") == "success" \
-                    and detail.get("score") is not None:
-                dimension_scores[dim] = float(detail["score"])
-                eval_details[dim] = dict(detail, reused=True)
-                merged_from_previous.append(dim)
-        if merged_from_previous:
-            print(f"\n  Merged {len(merged_from_previous)} dimension(s) from previous results: "
-                  f"{', '.join(merged_from_previous)}")
-
-    # Step 3: Calculate final scores
+    # Step 3: Final scores (per-dimension snapshots were already written in
+    # [2/3], so an interruption loses at most the dimension in progress)
     print(f"\n[3/3] Calculating final scores...")
     quality_score, semantic_score, total_score, normalized = calculate_scores(
         dimension_scores, dimensions
     )
-
     is_partial = len(dimension_scores) < len(ALL_DIMENSIONS)
-
-    # Save comprehensive results
-    results = {
-        "summary": {
-            "quality_score": round(quality_score, 4),
-            "semantic_score": round(semantic_score, 4),
-            "total_score": round(total_score, 4),
-            "is_partial_evaluation": is_partial,
-            "evaluated_dimensions": len(dimension_scores),
-            "total_dimensions": len(ALL_DIMENSIONS),
-        },
-        "dimension_scores": {
-            dim: round(score, 4) for dim, score in dimension_scores.items()
-        },
-        "normalized_scores": {
-            k: round(v, 4) for k, v in normalized.items()
-        },
-        "details": eval_details,
-    }
-
-    os.makedirs(args.output_path, exist_ok=True)
-    # Safety backup of the previous results before overwriting
-    if os.path.exists(results_path):
-        try:
-            shutil.copy2(results_path, results_path + ".bak")
-        except Exception as e:
-            print(f"  WARNING: could not back up previous results: {e}")
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    save_results_snapshot()
 
     # Print results table (canonical dimension order).
     # NOTE: failed dimensions are shown but do NOT contribute to the scores —
