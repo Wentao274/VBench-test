@@ -197,3 +197,7 @@ VBench-2.0/scripts/temp.py
 
 # documentations
 README-pypi.md
+
+# Local VBench pipeline config (real internal addresses / future tokens)
+# Template with placeholders is committed as vbench.env.example
+vbench.env

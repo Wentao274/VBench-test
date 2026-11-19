@@ -34,10 +34,27 @@ run_vbench_main.py (主入口)
 
 ### 1. Python 环境
 
+> 建议使用隔离环境（venv / conda / uv 均可）：`requirements.txt` 中有老版本 pin（`numpy<2.0.0`、`transformers==4.33.2`），直接装进系统 Python 可能与其他项目冲突。以下两种方式二选一。
+
+**方式 A：pip（venv）**
+
 ```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
 ```
+
+**方式 B：uv**
+
+```bash
+uv venv --python 3.10
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+uv pip install -r requirements.txt
+```
+
+> 之后每次运行脚本前先激活环境。注意 `torch` 必须先于 `requirements.txt` 单独安装（带 CUDA 版本，requirements.txt 中未包含）。
 
 ### 2. VBench 预训练模型权重
 
@@ -60,6 +77,7 @@ python run_vbench_main.py ... --load_ckpt_from_local
 
 ```bash
 pip install detectron2@git+https://github.com/facebookresearch/detectron2.git
+# uv 用户等价：uv pip install detectron2@git+https://github.com/facebookresearch/detectron2.git
 ```
 
 > 如果不需要这四个维度，可跳过安装，评测时会自动标记为失败，不影响其他维度。
@@ -80,35 +98,182 @@ VBench 评测需要 CUDA GPU（`evaluate.py` 中 `device = torch.device("cuda")`
 
 ## 在 GPU 机器上部署（推荐架构）
 
-MiniMax-H3 部署在 GPU 节点上时，推荐将本仓库完整 clone 到该节点执行：采样通过 localhost 直连 Gateway（视频不跨网络传输），评测使用节点 CUDA，本地 CPU 机器只负责编辑脚本和查看结果。
+流水线跑在一台有 CUDA 的机器上，通过 HTTP 访问被测模型服务（MiniMax-H3 + Video Gateway）。模型与评测机**是否同机均可**，区别只是网关地址不同：
 
-> **流程逻辑保持不变**：桥接脚本 `sample_videos.py` 读取 VBench 官方提示词 → 调用模型 API 生成视频 → 生成的视频作为输入，交给 `evaluate_videos.py` 调用原版 VBench 评测。所有新增脚本只做流程编排和环境准备，不改变 VBench 原始评测逻辑。
+```
+被测模型所在机器                         评测机（GPU，执行本流水线）
+MiniMax-H3 + Video Gateway   ←──HTTP──  run_vbench_main.py（主入口）
+                                             ├─ sample_videos.py   提交/轮询/下载，视频落盘
+                                             └─ evaluate_videos.py  本地 CUDA 评测，出分
+```
 
-### 首次部署 checklist
+> **流程逻辑**：桥接脚本读取 VBench 官方提示词 → 调用模型 API 生成视频 → 生成的视频作为输入，交给原版 VBench 评测。新增脚本只做流程编排和环境准备，不改变 VBench 原始评测逻辑。
+
+下文 `<GATEWAY_URL>` 指你的网关地址，按实际部署替换：
+- 模型与评测**同机**：`http://localhost:8000`
+- 模型在**其他机器**：`http://<IP>/<路由名>`，如 `http://10.xxx.xxx.xxx/sp-xxx-xxxx`（支持带路径前缀的网关；真实地址填在 `vbench.env`，不入库）
+
+### 首次部署：从零到出分（逐步执行）
+
+#### 第 1 步：获取代码
 
 ```bash
-# 1. Python 环境（GPU 节点）
+git clone https://github.com/Wentao274/VBench-test.git
+cd VBench-test
+```
+
+#### 第 2 步：安装 Python 环境（每台机器一次）
+
+**做什么**：安装三类依赖。PyTorch 是 GPU 版且必须**先单独装**（requirements.txt 里没有）；detectron2 只有 `object_class` / `multiple_objects` / `color` / `spatial_relationship` 4 个维度需要，不测可跳过。
+
+```bash
+# venv 用户先执行: python -m venv .venv && source .venv/bin/activate
+# uv   用户先执行: uv venv --python 3.10 && source .venv/bin/activate，并把下面的 pip 换成 uv pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
-pip install detectron2@git+https://github.com/facebookresearch/detectron2.git   # GRiT 4 维度需要
+pip install detectron2@git+https://github.com/facebookresearch/detectron2.git   # 可选
+```
 
-# 2. 预下载评测权重（调用原版 vbench.utils，仅下载文件不评测）
+**验收**：
+
+```bash
+python -c "import torch; print(torch.cuda.is_available())"   # 期望输出 True
+```
+
+#### 第 3 步：预下载评测权重（每台机器一次）
+
+**做什么**：16 个维度的评测要用十几个第三方模型文件（DINO、CLIP、GRiT、RAFT、UMT、ViCLIP 等，合计数 GB）。提前调用**原版** `vbench.utils.init_submodules` 下到 `~/.cache/vbench/`，避免评测中途才发现缺权重。
+
+```bash
 python evaluate_videos.py --all --download_weights
+```
 
-# 3. 环境体检（Gateway / CUDA / 显存 / 权重 / 磁盘 / detectron2）
+**验收**：输出 `Weight download complete`；`ls ~/.cache/vbench/` 出现 `amt_model`、`raft_model`、`grit_model` 等目录。
+
+> 只测部分维度时把 `--all` 换成 `--dimensions ...`，只下载所选维度所需权重。
+
+#### 第 4 步：环境体检
+
+**做什么**：正式开跑前一次性检查 6 项，全过再继续。正式运行时这些检查也会自动先执行。
+
+```bash
 python run_vbench_main.py \
-    --gateway_url http://localhost:8000 \
+    --gateway_url <GATEWAY_URL> \
     --model minimax-h3 --all \
     --output_dir ./sampled_videos/h3 \
     --preflight
 ```
 
-### 长任务与多卡
+| 检查项 | 查什么 | 不通过怎么办 |
+|---|---|---|
+| Gateway | 网关可达、`minimax-h3` 在模型列表 | 核对地址与网络连通性 |
+| 磁盘 | 按 6220 条视频估算 ~95GB | 清理空间或换目录 |
+| CUDA | torch 可用、各卡显存余量（<8GB 告警） | 重装 CUDA 版 torch；显存紧张用 `--gpu_id` 换卡 |
+| 权重 | `~/.cache/vbench/` 按维度逐一核对 | 回到第 3 步补齐 |
+| detectron2 | 选了 GRiT 4 维度时才检查 | 回到第 2 步，或去掉这 4 个维度 |
+| 视频 | `--skip_sample` 模式下目录里有视频 | `--output_dir` 指向正确的目录 |
 
-- 采样需数小时，在 `tmux` / `screen` 中运行，SSH 断线不影响；中断后重跑同一命令可续
-- 与模型 serving 共享 GPU 时注意显存（预检会报告各卡余量，评测约需 8GB 以上空闲显存）
-- 多卡节点用 `--gpu_id 1` 指定空闲卡（等价于 `CUDA_VISIBLE_DEVICES=1`）
-- Linux 自带 `wget`，缺权重时评测过程会自动下载（建议提前 `--download_weights` 拉齐）
+**验收**：`0 preflight check(s) FAILED`。
+
+#### 第 5 步：冒烟测试（约 15 分钟）
+
+**做什么**：只取 1 个提示词生成 5 条视频，走完「生成 → 下载 → 落盘 → 评测 → 出分」全链路。全通了再跑全量，避免全量跑几小时后在最后一环翻车。
+
+```bash
+python run_vbench_main.py \
+    --gateway_url <GATEWAY_URL> \
+    --model minimax-h3 \
+    --dimensions subject_consistency \
+    --max_prompts 1 \
+    --output_dir ./sampled_videos/smoke
+```
+
+**验收**：
+- 采样统计 `success 5 / failed 0`；若报 `submit HTTP 400` 且提示 `generate_sound`，说明该网关版本不认识此字段（需改一行代码，见 FAQ）
+- `sampled_videos/smoke/<时间戳>/` 下有 5 个 `.mp4`，手动播放确认画面正常
+- 终端分数表 `subject_consistency` 有 [0,1] 区间分数，`evaluation_results/final_scores.json` 已生成
+
+> 首次评测 `subject_consistency` 会联网下载 DINO 权重，多等几分钟属正常。
+
+#### 第 6 步：正式全量评测（数小时，建议 tmux）
+
+**做什么**：16 维度 × 944 提示词 = 6220 条视频 + 全量评测。在 `tmux` / `screen` 中运行，SSH 断线不影响：
+
+```bash
+tmux new -s vbench
+python run_vbench_main.py \
+    --gateway_url <GATEWAY_URL> \
+    --model minimax-h3 --all \
+    --output_dir ./sampled_videos/h3
+# 按 Ctrl+B 再按 D 脱离会话；重新登录后 tmux attach -t vbench 回来看进度
+```
+
+中断（断网/断电/手动 Ctrl+C）后**重跑同一命令**即可续跑：已落盘的视频自动跳过，已成功的评测维度自动复用，从断点继续。
+
+> 已按下文「配置文件运行」创建 `vbench.env` 的话，本步命令可简化为 `./run.sh`。
+
+#### 第 7 步：查看与对比结果
+
+**结果位置**：`<output_dir>/<时间戳>/evaluation_results/final_scores.json`，运行结束时终端也会打印 16 维度分数表 + Quality / Semantic / Total 汇总。
+
+多次评测（不同模型/参数）后一键对比：
+
+```bash
+python compare_runs.py \
+    run1/evaluation_results/final_scores.json \
+    run2/evaluation_results/final_scores.json
+```
+
+### 长任务与多卡提示
+
+- 与模型 serving 共享 GPU 时注意显存：预检会报告各卡余量，评测约需 8GB 以上空闲
+- 多卡节点用 `--gpu_id 1` 指定空闲卡（等价 `CUDA_VISIBLE_DEVICES=1`）
+- Linux 缺权重时评测过程会用 `wget` 自动下载（建议第 3 步提前拉齐）
+- 更多命令变体（dry_run 预览、只采样、只评测、指定维度等）见下文「快速开始」
+
+---
+
+## 配置文件运行（推荐：免敲重复参数）
+
+`gateway_url`、`model`、`output_dir` 这类每次都一样的参数集中到 `vbench.env`，日常只敲 `./run.sh`；临时参数在命令行追加即可（命令行优先于配置文件）。
+
+### 一次性设置（Linux 评测机，约 1 分钟）
+
+```bash
+cp vbench.env.example vbench.env   # 1. 从模板创建真实配置
+vim vbench.env                     # 2. 只需替换 GATEWAY_URL 等真实值
+chmod +x run.sh                    # 3. 赋予执行权限（之后 ./run.sh 直接可用）
+```
+
+`vbench.env` 配置项说明：
+
+| 配置项 | 必填 | 说明 |
+|---|---|---|
+| `GATEWAY_URL` | 是 | 网关地址。模型同机：`http://localhost:8000`；模型在其他机器：`http://<IP>/<路由名>` |
+| `MODEL` | 是 | 模型名，必须出现在网关 `GET /v1/models` 列表中 |
+| `OUTPUT_DIR` | 是 | 采样输出根目录，每次运行自动创建时间戳子目录 |
+| `GPU_ID` | 否 | 多卡节点指定空闲卡（留空 = 默认 0 号卡） |
+| `DIMENSIONS` | 否 | 只测部分维度，空格分隔（留空 = 全部 16 个维度） |
+| `LOAD_LOCAL` | 否 | `true` = 附加 `--load_ckpt_from_local`（内网受限机器用，下载权重时也要同样设置） |
+| `API_TOKEN` | 否 | 预留。将来网关增加鉴权时填，当前脚本尚未使用 |
+
+### 日常使用
+
+```bash
+./run.sh                                                  # 按配置全量运行（建议 tmux 中）
+./run.sh --preflight                                      # 环境体检
+./run.sh --skip_sample                                    # 只评测最新一批已生成的视频
+./run.sh --dimensions subject_consistency --max_prompts 1 # 冒烟测试（临时参数覆盖配置）
+```
+
+> **覆盖规则**：配置文件管每次都一样的参数，命令行管本次临时参数；两者冲突时命令行优先。
+> `run.sh` 每次运行会先打印实际执行的完整命令，便于核对参数。
+
+### 敏感信息管理
+
+- **真实配置 `vbench.env` 不入库**：已加入 `.gitignore`，内网地址、未来的鉴权 token 等敏感值只存在于此文件
+- **入库的是模板 `vbench.env.example`**：只含占位符，无真实值
+- 将来 Gateway 增加鉴权时，在 `vbench.env` 中填 `API_TOKEN` 即可，同样不会提交
 
 ---
 
@@ -151,14 +316,15 @@ python run_vbench_main.py \
 
 ### 烟雾测试（先小规模验证端到端流程）
 
-首次使用建议先限制提示词数量，快速验证「生成 → 评测 → 出分」全链路：
+首次使用建议先只取 1 个提示词生成 5 条视频，快速验证「生成 → 评测 → 出分」全链路（与部署指南第 5 步相同）：
 
 ```bash
 python run_vbench_main.py \
     --gateway_url http://localhost:8000 \
-    --model minimax-h3 --all \
+    --model minimax-h3 \
+    --dimensions subject_consistency \
+    --max_prompts 1 \
     --output_dir ./sampled_videos/smoke \
-    --max_prompts 2 \
     --load_ckpt_from_local
 ```
 
